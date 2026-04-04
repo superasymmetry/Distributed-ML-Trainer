@@ -1,0 +1,19 @@
+for epoch in range(metrics["epoch"], EPOCHS + 1):
+    model.train()
+    total_loss = 0.0
+    for batch_idx, (data, target) in enumerate(DataLoader(datasets.FakeData(transform=transforms.ToTensor()), batch_size=32)):
+        data, target = data.to(device), target.to(device)
+        optimizer.zero_grad()
+        output = model(data)
+        loss = torch.nn.functional.cross_entropy(output, target)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    
+    avg_loss = total_loss / (batch_idx + 1)
+    metrics["loss_history"].append(round(avg_loss, 4))
+    metrics["epoch"] = epoch
+    
+    # write_metrics(metrics, JOB_ID)
+    
+    print(f"epoch {epoch}/{EPOCHS}  loss={avg_loss:.4f}", flush=True)
