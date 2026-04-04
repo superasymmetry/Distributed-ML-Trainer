@@ -2,7 +2,8 @@
 
 torch>=2.4.0
 torchvision
-torchaudio
 timm
 kubernetes
 groq
+fastapi
+uvicorn
