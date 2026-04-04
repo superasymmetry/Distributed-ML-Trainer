@@ -19,4 +19,4 @@ jobs:
         pip install pytest httpx fastapi
     - name: Run tests
       run: |
-        pytest -m pytest
+        python -m pytest
