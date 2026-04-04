@@ -24,12 +24,6 @@ def write_metrics(metrics: dict, JOB_ID):
             "UPDATE jobs SET metrics=?, updated_at=? WHERE id=?",
             (json.dumps(metrics), datetime.utcnow().isoformat(), JOB_ID))
  
-def fake_loss(epoch: int, lr: float) -> float:
-    """Simulate a realistic loss curve with a bit of noise."""
-    base = 1.0 * math.exp(-lr * epoch * 3)
-    noise = random.gauss(0, 0.01)
-    return max(0.01, base + noise)
- 
 def train(JOB_ID, MODEL, EPOCHS, LR, DATASET):
     if os.path.exists(MODEL):
         print(f"loading existing model from {MODEL}",flush=True)

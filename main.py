@@ -3,6 +3,7 @@ import uuid
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
+from kubernetes import client, config
 import sqlite3
 import json
 
@@ -93,7 +94,7 @@ def submit_job(config: JobConfig):
         with open("worker/train_code.txt") as f:
             config.code = f.read()
     cursor.execute("INSERT INTO jobs (id, status, config, metrics) VALUES (?, 'queued', ?, '{}')",
-                   (job_id, config.json()))
+                   (job_id, config.model_dump_json()))
     conn.commit()
     conn.close()
     return {"job_id": job_id}
@@ -127,12 +128,30 @@ def delete_job(job_id: str = None, ):
 
 @app.get("/health")
 def health():
+    health_status = {"database": "ok", "api": "ok", "kubernetes": {}}
     try:
         conn, cursor = connect_db()
         cursor.execute("SELECT 1")
-        return {"status": "ok"}
     except Exception as e:
-        raise HTTPException(500, str(e))
+        health_status["database"] = f"error: {str(e)}"
+    
+    try:
+        try:
+            config.load_incluster_config()
+        except config.ConfigException:
+            config.load_kube_config()
+
+        api_client = client.ApiClient()
+        livez_res = api_client.call_api("/livez", "GET", _preload_content=False)
+        readyz_res = api_client.call_api("/readyz", "GET", _preload_content=False)
+        health_status["kubernetes"] = {
+            "livez": livez_res[1],
+            "readyz": readyz_res[1]
+        }
+    except Exception as e:
+        health_status["kubernetes"] = f"error: {str(e)}"
+
+    return health_status
 
 @app.get("/api/dashboard_data")
 def dashboard_data():

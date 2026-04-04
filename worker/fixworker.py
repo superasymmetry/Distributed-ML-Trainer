@@ -66,5 +66,5 @@ def fix(job_id, old_code):
     with db() as conn:
         conn.execute(
             "UPDATE jobs SET config=?, updated_at=? WHERE id=?",
-            (json.dumps({"code": corrections}), datetime.utcnow().isoformat(), job_id))
+            (json.dumps({"code": corrections}), datetime.datetime.now(datetime.timezone.utc).isoformat(), job_id))
         
