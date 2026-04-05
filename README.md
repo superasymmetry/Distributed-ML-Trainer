@@ -1,3 +1,5 @@
+## A Machine Learning Engineer's Dream! (AMLED!)
+
 A Machine Learning Engineer's Dream! (AMLED!) is a Kubernetes-backed ML training job scheduler. You submit training jobs through a web UI or REST API, and a controller process picks them up, launches a Kubernetes pod for each job, monitors it, and handles failures. It also automatically self-heals via an LLM-assisted code fixer.
 
 ## How it works
