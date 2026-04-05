@@ -1,69 +1,76 @@
-# Demo Runbook (2 Minutes)
+## Demo Runbook
 
-This runbook is optimized for the hackathon reliability demo.
+This is the script for demonstrating AMLED! end to end, including the error handling and self-healing features.
 
-## Pre-Demo Setup
-1. Start API + controller:
-```bash
-fastapi dev main.py
-python -m controller.controller
+### Before you start
+
+Make sure all of this is true:
+- Docker Desktop is running with Kubernetes enabled
+- `kubectl get nodes` shows a Ready node
+- The worker image is built
+- The PVC exists: `kubectl get pvc trainctl-data`
+- The API is running on port 8000
+- The controller is running in a separate terminal with `python -m controller.controller`
+
+Open `http://localhost:8000` in a browser.
+
+For more information on how to setup the project, read [the readme](https://github.com/superasymmetry/Distributed-ML-Trainer/blob/main/README.md)
+---
+
+### Submit a valid job
+
+1. Click **New Job** from the home page
+2. Leave the defaults (`test_efficientnet.r160_in1k`, `mnist`, 10 epochs, lr 0.01) and click **Launch Pod**
+3. You'll see a green popup of *"Job queued successfully!"* and get redirected to the dashboard
+4. Watch the dashboard — within 5 seconds the status changes from `QUEUED` to `RUNNING`
+5. After the first epoch completes, the epoch counter and loss column start updating
+
+---
+
+### Failure demos
+
+Now we will demonstrate how AMLED! recovers upon failure.
+
+Go to `/submit` and try each of these:
+
+**Bad model name:**
 ```
-2. Ensure worker image exists:
-```bash
-docker build -t distributed-trainer-worker:latest .
+model: resnet999
 ```
-3. Confirm health:
-```bash
-curl -sS http://127.0.0.1:8000/health
+Expected: red toast saying the model wasn't found, with suggestions if any close matches exist.
+
+**Negative learning rate:**
 ```
-
-## Demo Sequence
-
-### 0:00-0:25 Bad Input -> Clean JSON Error
-```bash
-scripts/chaos/01_bad_input_check.sh
+lr: -0.5
 ```
-Expected:
-- `POST /jobs` returns JSON `detail` errors.
-- API remains healthy.
+Expected: red toast saying LR must be positive.
 
-### 0:25-0:55 Crash API Process -> Auto Recovery
-```bash
-scripts/chaos/02_api_restart_recovery.sh
+**Multiple errors at once:**
 ```
-Expected:
-- API process is force-crashed inside the running container.
-- Docker runtime recovers service (auto-restart where detectable, otherwise controlled restart fallback).
-- `/health` returns `200` again within timeout.
-
-### 0:55-1:30 Kill Worker Pod -> Controller Handles Transition
-```bash
-scripts/chaos/03_worker_pod_kill_recovery.sh
+model: fakemodel123
+epochs: -5
+lr: 0
 ```
-Expected:
-- Worker pod is deleted mid-job.
-- Job status transitions cleanly (re-queued/retried or terminal failure), not stuck forever.
+Expected: three separate red toasts sliding in one after another, one per error. No pod is ever launched.
 
-### 1:30-2:00 Checkpoint Resume Proof
+---
+
+**Crash recovery**
+
+While a job is running, kill its pod to simulate a crash. For example (I have a pod, api-1, in the distributed-trainer container):
+
 ```bash
-scripts/chaos/04_checkpoint_resume_check.sh
+docker exec distributed-trainer-api-1 kill 1 
 ```
-Expected:
-- Checkpoint file exists before pod kill.
-- After restart, worker logs show `resumed from checkpoint ...`.
+<img width="1593" height="901" alt="image" src="https://github.com/user-attachments/assets/11f5e387-7988-4cef-bcb7-0484e2b8bd59" />
 
-### Optional Scalability Clip (for Top Scalability category)
-```bash
-scripts/chaos/05_load_test.sh
-```
-Expected:
-- 50 concurrent `POST /jobs` requests return `200`.
-- Script prints p50/p99 latency.
-- `/health` remains `200` after load.
+1. The pod disappears
+2. The controller detects the `Failed`/missing pod
+3. The job status resets to `QUEUED`
+4. The container restarts a pod
+5. The worker logs show `"resumed from checkpoint at epoch N"` — it picks up where it left off
 
-## Demo Artifacts to Capture
-- Terminal output from each script.
-- `docker ps` evidence of API restart.
-- `kubectl get pods` and `kubectl logs` snippets for worker recovery.
-- Load-test output with p50/p99 latency.
-- Link to `FAILURE_MODES.md` in submission.
+This demonstrates that the PVC-backed checkpointing is working correctly.
+
+---
+
