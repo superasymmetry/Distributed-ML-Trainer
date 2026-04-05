@@ -1,15 +1,24 @@
 name: Run Tests
 
-on: [push]
+on:
+  push:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
     - name: Set up Python 3.13
-      uses: actions/setup-python@v2
+      uses: actions/setup-python@v5
       with:
         python-version: '3.13'
     - name: Install dependencies
@@ -36,6 +45,10 @@ jobs:
     - name: Run tests
       run: |
         pytest --cov=. --cov-fail-under=60 tests/
+    - name: Show API logs on failure
+      if: failure()
+      run: |
+        cat /tmp/trainctl-api.log || true
     - name: Stop API server
       if: always()
       run: |

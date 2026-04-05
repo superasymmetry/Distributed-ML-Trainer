@@ -41,6 +41,7 @@ def test_api_health_integration():
     data = response.json()
     assert data["database"] == "ok"
     assert data["api"] == "ok"
+    assert "kubernetes" in data
 
 
 def test_submit_job_integration():
@@ -76,6 +77,18 @@ def test_list_jobs_integration(mock_job_id):
     assert isinstance(jobs, list)
     job_ids = [job[0] for job in jobs]
     assert mock_job_id in job_ids
+
+
+def test_list_jobs_row_shape_integration(mock_job_id):
+    """GET /jobs -> Verify response row shape is stable."""
+    response = httpx.get(f"{BASE_URL}/jobs")
+    assert response.status_code == 200
+
+    jobs = response.json()
+    row = next((job for job in jobs if job[0] == mock_job_id), None)
+    assert row is not None
+    assert len(row) == 8
+    assert row[1] == "queued"
 
 
 def test_get_job_integration(mock_job_id):
@@ -122,6 +135,14 @@ def test_dashboard_data_integration(mock_job_id):
     assert mock_job_entry["status"] == "QUEUED"
     assert "last_loss" in mock_job_entry
     assert "epoch" in mock_job_entry
+    assert sorted(mock_job_entry.keys()) == [
+        "created_at",
+        "epoch",
+        "id",
+        "last_loss",
+        "status",
+        "status_raw",
+    ]
 
 
 def test_dashboard_html_integration():
