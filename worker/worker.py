@@ -23,7 +23,28 @@ def write_metrics(metrics: dict, JOB_ID):
         conn.execute(
             "UPDATE jobs SET metrics=?, updated_at=? WHERE id=?",
             (json.dumps(metrics), datetime.utcnow().isoformat(), JOB_ID))
- 
+        
+def save_checkpoint(job_id, epoch, model, optimizer, metrics):
+    os.makedirs("/data/checkpoints", exist_ok=True)
+    torch.save({
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "metrics": metrics,
+    }, f"/data/checkpoints/job-{job_id}.pt")
+    print(f"checkpoint saved at epoch {epoch}", flush=True)
+
+def load_checkpoint(job_id, model, optimizer):
+    path = f"/data/checkpoints/job-{job_id}.pt"
+    if not os.path.exists(path):
+        return 0, {"loss_history": [], "epoch": 0, "status": "training"}
+    
+    ckpt = torch.load(path)
+    model.load_state_dict(ckpt["model_state_dict"])
+    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    print(f"resumed from checkpoint at epoch {ckpt['epoch']}", flush=True)
+    return ckpt["epoch"], ckpt["metrics"]
+
 def train(JOB_ID, MODEL, EPOCHS, LR, DATASET):
     if os.path.exists(MODEL):
         print(f"loading existing model from {MODEL}",flush=True)
@@ -35,15 +56,19 @@ def train(JOB_ID, MODEL, EPOCHS, LR, DATASET):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device)
     
+    optimizer = optim.Adam(model.parameters(), lr=LR)
+    start_epoch, metrics = load_checkpoint(JOB_ID, model, optimizer)
+
     metrics = {"loss_history": [], "epoch": 0, "status": "training"}
 
-    optimizer = optim.Adam(model.parameters(), lr=LR)
     print(f"starting job {JOB_ID} model={MODEL} epochs={EPOCHS} lr={LR}", flush=True)
-    
-    for epoch in range(metrics["epoch"], EPOCHS + 1):
+
+    train_dataset = datasets.FakeData(size=128, image_size=(3, 32, 32), num_classes=10, transform=transforms.ToTensor())
+
+    for epoch in range(start_epoch, EPOCHS + 1):
         model.train()
         total_loss = 0.0
-        for batch_idx, (data, target) in enumerate(DataLoader(datasets.FakeData(transform=transforms.ToTensor()), batch_size=32)):
+        for batch_idx, (data, target) in enumerate(DataLoader(train_dataset, batch_size=8, num_workers=0, shuffle=True)):
             data, target = data.to(device), target.to(device)
             optimizer.zero_grad()
             output = model(data)
@@ -51,15 +76,17 @@ def train(JOB_ID, MODEL, EPOCHS, LR, DATASET):
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
+            print(" batch", batch_idx, "loss", loss.item(), flush=True)
         
         avg_loss = total_loss / (batch_idx + 1)
         metrics["loss_history"].append(round(avg_loss, 4))
         metrics["epoch"] = epoch
         
-        # REMOVED: Database UPDATE call that crashes the pod
+        print("metrics at epoch", epoch, metrics, flush=True)
+        save_checkpoint(JOB_ID, epoch, model, optimizer, metrics)
         # write_metrics(metrics, JOB_ID)
+        print("saved checkpoint for epoch", epoch, flush=True)
         
-        # This print statement is what you want to see!
         print(f"epoch {epoch}/{EPOCHS}  loss={avg_loss:.4f}")
 
     # try:

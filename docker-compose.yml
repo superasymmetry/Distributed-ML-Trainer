@@ -9,3 +9,4 @@ services:
     restart: always
     volumes:
       - ./jobs.db:/app/jobs.db
+    shm_size: '2gb'

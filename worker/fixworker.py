@@ -1,8 +1,11 @@
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import os
+from dotenv import load_dotenv
 from groq import Groq
 import sqlite3
+
+load_dotenv()
 
 TRAIN_CODE_PATH = "worker/train_code.txt"
 DB = os.getenv("DB_PATH", "jobs.db")
@@ -19,7 +22,7 @@ def extract_error(job_id):
     return logs
 
 def fix(job_id, old_code):
-    client = Groq()
+    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
     error_section = extract_error(job_id)
     prompt = f"""You are an expert Python SRE engineer. A distributed training worker script has \
     failed in production. Your job is to fix it and return ONLY the corrected, complete Python file.
@@ -66,5 +69,4 @@ def fix(job_id, old_code):
     with db() as conn:
         conn.execute(
             "UPDATE jobs SET config=?, updated_at=? WHERE id=?",
-            (json.dumps({"code": corrections}), datetime.datetime.now(datetime.timezone.utc).isoformat(), job_id))
-        
+            (json.dumps({"code": corrections}), datetime.now(timezone.utc).isoformat(), job_id))        

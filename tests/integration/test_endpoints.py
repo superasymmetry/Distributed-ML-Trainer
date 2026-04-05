@@ -41,7 +41,7 @@ def test_api_health_integration():
 def test_submit_job_integration():
     """POST /jobs -> Verify it saves to the real SQLite file."""
     payload = {
-        "model": "resnet18",
+        "model": "test_efficientnet.r160_in1k",
         "dataset": "mnist",
         "epochs": 1,
         "lr": 0.02,
@@ -58,7 +58,7 @@ def test_submit_job_integration():
     conn.close()
 
     assert row is not None
-    assert json.loads(row[0])["model"] == "resnet18"
+    assert json.loads(row[0])["model"] == "test_efficientnet.r160_in1k"
     
     # manual cleanup for this specific test
     httpx.delete(f"{BASE_URL}/jobs/{job_id}")

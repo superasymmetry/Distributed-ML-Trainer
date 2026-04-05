@@ -8,6 +8,8 @@ from kubernetes import client, config
 import sqlite3
 import json
 
+import timm
+
 app = FastAPI()
 
 
@@ -45,6 +47,23 @@ class JobConfig(BaseModel):
     epochs: int
     lr: float
     code: str
+
+def validate_config(config: JobConfig):
+    model = config.get("model")
+    epochs = config.get("epochs")
+    lr = config.get("lr")
+    dataset = config.get("dataset")
+
+    if not model or not isinstance(model, str):
+        raise HTTPException(status_code=400, detail="Model name must be a non-empty string")
+    if not isinstance(epochs, int) or epochs <= 0:
+        raise HTTPException(status_code=400, detail="Epochs must be a positive integer")
+    if not isinstance(lr, (int, float)) or lr <= 0:
+        raise HTTPException(status_code=400, detail="Learning rate must be a positive number")
+    if not dataset or not isinstance(dataset, str):
+        raise HTTPException(status_code=400, detail="Dataset name must be a non-empty string")
+    if not timm.is_model(config.model):
+        raise HTTPException(status_code=400, detail=f"Model {config.model} not found in timm library")
 
 @app.get("/", response_class=HTMLResponse)
 def root():
@@ -226,7 +245,7 @@ def submit_page():
     <script type="module">
         import { createApp } from 'https://unpkg.com/petite-vue?module'
         createApp({
-            model: 'resnet34', dataset: 'mnist', epochs: 10, lr: 0.01, loading: false, msg: '',
+            model: 'test_efficientnet.r160_in1k', dataset: 'mnist', epochs: 10, lr: 0.01, loading: false, msg: '',
             async submit() {
                 this.loading = true;
                 const req = await fetch('/jobs', { 
@@ -300,7 +319,7 @@ def manage_page():
         createApp({
             FileManager,
             jobs: [],
-            newJob: { model: 'resnet34', dataset: 'mnist', epochs: 10, lr: 0.01 },
+            newJob: { model: 'test_efficientnet.r160_in1k', dataset: 'mnist', epochs: 10, lr: 0.01 },
             adding: false,
             async poll() {
                 const req = await fetch('/api/dashboard_data');

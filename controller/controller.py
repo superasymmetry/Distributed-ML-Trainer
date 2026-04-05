@@ -31,12 +31,18 @@ def launch_pod(job_id, image, config: dict):
         metadata=client.V1ObjectMeta(name=f"job-{job_id}"),
         spec=client.V1PodSpec(
             restart_policy="Never",
-            volumes=[client.V1Volume(
-                name="jobdata",
-                persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
-                    claim_name="trainctl-data"
+            volumes=[
+                client.V1Volume(
+                    name="jobdata",
+                    persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
+                        claim_name="trainctl-data"
+                    )
+                ),
+                client.V1Volume(
+                    name="dshm",
+                    empty_dir=client.V1EmptyDirVolumeSource(medium="Memory", size_limit="2Gi")
                 )
-            )],
+            ],
             containers=[client.V1Container(
                 name="worker",
                 image=image,
@@ -48,7 +54,7 @@ def launch_pod(job_id, image, config: dict):
                 env=[
                     client.V1EnvVar("JOB_ID", job_id),
                     client.V1EnvVar("DB_PATH", "/data/jobs.db"),
-                    client.V1EnvVar("MODEL", config.get("model", "resnet18")),
+                    client.V1EnvVar("MODEL", config.get("model", "test_efficientnet.r160_in1k")),
                     client.V1EnvVar("EPOCHS", str(config.get("epochs", 10))),
                     client.V1EnvVar("LR", str(config.get("lr", 0.01))),
                     client.V1EnvVar("DATASET", config.get("dataset", "mnist")),
@@ -62,7 +68,7 @@ def launch_pod(job_id, image, config: dict):
 def pod_phase(job_id):
     try:
         pod = core.read_namespaced_pod(f"job-{job_id}", "default")
-        return pod.status.phase  # Pending / Running / Succeeded / Failed
+        return pod.status.phase
     except client.exceptions.ApiException as e:
         if e.status == 404:
             return None  # pod is gone
@@ -102,15 +108,17 @@ def run():
                         phase = pod_phase(job["id"])
                         if phase == "Succeeded":
                             conn.execute("UPDATE jobs SET status='complete' WHERE id=?", (job["id"],))
-                            # delete_pod(job["id"])
+                            delete_pod(job["id"])
                         elif phase == "Failed":
-                            fix(job["id"])
+                            fix(job["id"], open("train_code.txt").read())
+                            delete_pod(job["id"])
                             conn.execute("UPDATE jobs SET status='failed' WHERE id=?", (job["id"],))
                             # delete_pod(job["id"])
                         
             
         except Exception as e:
-            log.error(f"Error in controller loop: {e}")
+            log.error(f"Error in controller loop: {e}, trying to fix.")
+            fix(job["id"], open("worker/train_code.txt").read())
 
         time.sleep(5)
 
