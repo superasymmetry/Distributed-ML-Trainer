@@ -1,10 +1,14 @@
 import os
 import re
 import uuid
+import time
+import logging
+import threading
 from datetime import datetime, timezone
+from collections import defaultdict, deque
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile, status
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from kubernetes import client, config
@@ -13,10 +17,38 @@ import json
 
 import timm
 
+from logging_utils import configure_json_logging, reset_request_id, set_request_id
+
 app = FastAPI()
 DEFAULT_TRAINING_CODE_PATH = Path("worker") / "train_code.txt"
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads"))
 SAFE_UPLOAD_FILENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+APP_START_TIME = time.time()
+API_VERSION = os.getenv("API_VERSION", "1.0.0")
+JOB_COLUMNS = (
+    "id",
+    "status",
+    "config",
+    "metrics",
+    "retries",
+    "pod_name",
+    "created_at",
+    "updated_at",
+)
+
+RATE_LIMIT_ENABLED = os.getenv("JOB_SUBMIT_RATE_LIMIT_ENABLED", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+RATE_LIMIT_MAX_REQUESTS = int(os.getenv("JOB_SUBMIT_RATE_MAX_REQUESTS", "10"))
+RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("JOB_SUBMIT_RATE_WINDOW_SECONDS", "60"))
+RATE_LIMIT_BUCKETS: dict[str, deque[float]] = defaultdict(deque)
+RATE_LIMIT_LOCK = threading.Lock()
+
+configure_json_logging(service="api")
+log = logging.getLogger("trainctl.api")
 
 
 def connect_db(PATH="jobs.db"):
@@ -26,8 +58,8 @@ def connect_db(PATH="jobs.db"):
         raise HTTPException(status_code=500, detail="Database connection failed")
     return conn, cursor
 
+
 def init_db():
-    print("Initializing database...")
     conn, cursor = connect_db()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS jobs (
@@ -43,6 +75,7 @@ def init_db():
     """)
     conn.commit()
     conn.close()
+
 
 init_db()
 
@@ -74,6 +107,7 @@ class JobConfig(BaseModel):
     lr: float
     code: str | None = None
 
+
 def validate_config(job_config: JobConfig):
     errors = []
     model_name = job_config.model.strip() if isinstance(job_config.model, str) else ""
@@ -98,6 +132,117 @@ def validate_config(job_config: JobConfig):
         errors.append("Dataset name must be a non-empty string")
 
     return errors  # empty list = valid
+
+
+def parse_json_field(raw_value: object) -> object:
+    if not isinstance(raw_value, str):
+        return raw_value
+    try:
+        return json.loads(raw_value)
+    except json.JSONDecodeError:
+        return raw_value
+
+
+def serialize_job_row(row: tuple | list | None) -> dict | None:
+    if row is None:
+        return None
+
+    payload = dict(zip(JOB_COLUMNS, row))
+    payload["config"] = parse_json_field(payload.get("config"))
+    payload["metrics"] = parse_json_field(payload.get("metrics"))
+    return payload
+
+
+def get_client_ip(request: Request) -> str:
+    forwarded_for = request.headers.get("x-forwarded-for", "")
+    if forwarded_for:
+        first_ip = forwarded_for.split(",", 1)[0].strip()
+        if first_ip:
+            return first_ip
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
+def enforce_submit_rate_limit(client_ip: str) -> None:
+    if not RATE_LIMIT_ENABLED:
+        return
+
+    now = time.monotonic()
+    with RATE_LIMIT_LOCK:
+        bucket = RATE_LIMIT_BUCKETS[client_ip]
+        while bucket and (now - bucket[0]) > RATE_LIMIT_WINDOW_SECONDS:
+            bucket.popleft()
+
+        if len(bucket) >= RATE_LIMIT_MAX_REQUESTS:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=(
+                    f"Rate limit exceeded: max {RATE_LIMIT_MAX_REQUESTS} submissions "
+                    f"per {RATE_LIMIT_WINDOW_SECONDS} seconds for each client"
+                ),
+            )
+
+        bucket.append(now)
+
+
+def probe_database() -> tuple[bool, str]:
+    conn = None
+    try:
+        conn, cursor = connect_db()
+        cursor.execute("SELECT 1")
+        return True, "ok"
+    except Exception as exc:
+        return False, f"error: {exc}"
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def probe_kubernetes() -> dict | str:
+    try:
+        try:
+            config.load_incluster_config()
+        except config.ConfigException:
+            config.load_kube_config()
+
+        api_client = client.ApiClient()
+        livez_res = api_client.call_api(
+            "/livez", "GET", _preload_content=False, _request_timeout=1
+        )
+        readyz_res = api_client.call_api(
+            "/readyz", "GET", _preload_content=False, _request_timeout=1
+        )
+        return {"livez": livez_res[1], "readyz": readyz_res[1]}
+    except Exception as exc:
+        return f"error: {exc}"
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    request_id = request.headers.get("x-request-id", "").strip() or str(uuid.uuid4())
+    client_ip = get_client_ip(request)
+    token = set_request_id(request_id)
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    finally:
+        duration_ms = round((time.perf_counter() - started) * 1000, 2)
+        log.info(
+            "request complete",
+            extra={
+                "event": "request_complete",
+                "request_id": request_id,
+                "method": request.method,
+                "path": request.url.path,
+                "duration_ms": duration_ms,
+                "client_ip": client_ip,
+            },
+        )
+        reset_request_id(token)
+
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 @app.get("/", response_class=HTMLResponse)
 def root():
@@ -141,7 +286,10 @@ def root():
 
 
 @app.post("/jobs")
-def submit_job(config: JobConfig):
+def submit_job(config: JobConfig, request: Request):
+    client_ip = get_client_ip(request)
+    enforce_submit_rate_limit(client_ip)
+
     errors = validate_config(config)
     if errors:
         raise HTTPException(status_code=400, detail=errors)
@@ -164,7 +312,17 @@ def submit_job(config: JobConfig):
     )
     conn.commit()
     conn.close()
+    log.info(
+        "job queued",
+        extra={
+            "event": "job_queued",
+            "job_id": job_id,
+            "client_ip": client_ip,
+            "api_version": API_VERSION,
+        },
+    )
     return {"job_id": job_id}
+
 
 @app.get("/jobs")
 def list_jobs():
@@ -172,7 +330,7 @@ def list_jobs():
     cursor.execute("SELECT * FROM jobs")
     jobs = cursor.fetchall()
     conn.close()
-    return jobs
+    return [serialize_job_row(job) for job in jobs]
 
 
 @app.get("/jobs/{job_id}")
@@ -183,45 +341,88 @@ def get_job(job_id: str):
     conn.close()
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    return job
+    return serialize_job_row(job)
+
 
 @app.delete("/jobs/{job_id}")
-def delete_job(job_id: str = None):
+def delete_job(job_id: str):
     conn, cursor = connect_db()
+    cursor.execute("SELECT status FROM jobs WHERE id = ?", (job_id,))
+    row = cursor.fetchone()
+    if row is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if row[0] == "running":
+        conn.close()
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot delete a running job. Wait for completion/failure first.",
+        )
+
     cursor.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
     conn.commit()
+    deleted_rows = cursor.rowcount
     conn.close()
-    return job_id
+    if deleted_rows == 0:
+        raise HTTPException(status_code=404, detail="Job not found")
 
-@app.get("/health")
-def health():
-    health_status = {"database": "ok", "api": "ok", "kubernetes": {}}
+    log.info("job deleted", extra={"event": "job_deleted", "job_id": job_id})
+    return {"deleted_job_id": job_id}
+
+
+@app.get("/livez")
+def livez():
+    return {"status": "ok", "api_version": API_VERSION}
+
+
+@app.get("/readyz")
+def readyz(response: Response):
+    db_healthy, db_status = probe_database()
+    if not db_healthy:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "error", "database": db_status}
+    return {"status": "ok", "database": db_status}
+
+
+@app.get("/metrics")
+def metrics():
+    conn = None
     try:
         conn, cursor = connect_db()
-        cursor.execute("SELECT 1")
-    except Exception as e:
-        health_status["database"] = f"error: {str(e)}"
-    
-    try:
-        try:
-            config.load_incluster_config()
-        except config.ConfigException:
-            config.load_kube_config()
+        cursor.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status")
+        grouped = cursor.fetchall()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Database unavailable: {exc}",
+        ) from exc
+    finally:
+        if conn is not None:
+            conn.close()
 
-        api_client = client.ApiClient()
-        livez_res = api_client.call_api(
-            "/livez", "GET", _preload_content=False, _request_timeout=1
-        )
-        readyz_res = api_client.call_api(
-            "/readyz", "GET", _preload_content=False, _request_timeout=1
-        )
-        health_status["kubernetes"] = {
-            "livez": livez_res[1],
-            "readyz": readyz_res[1]
-        }
-    except Exception as e:
-        health_status["kubernetes"] = f"error: {str(e)}"
+    jobs_by_status = {row[0]: row[1] for row in grouped}
+    jobs_total = int(sum(jobs_by_status.values()))
+    uptime_seconds = int(max(0, time.time() - APP_START_TIME))
 
+    return {
+        "jobs_total": jobs_total,
+        "jobs_by_status": jobs_by_status,
+        "uptime_seconds": uptime_seconds,
+        "api_version": API_VERSION,
+    }
+
+
+@app.get("/health")
+def health(response: Response):
+    db_healthy, db_status = probe_database()
+    health_status = {
+        "database": db_status,
+        "api": "ok",
+        "kubernetes": probe_kubernetes(),
+    }
+    if not db_healthy:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
     return health_status
 
 @app.get("/api/dashboard_data")
@@ -523,7 +724,15 @@ def manage_page():
             },
             async deleteJob(jobId) {
                 if(!confirm(`Delete job ${jobId}?`)) return;
-                await fetch(`/jobs/${jobId}`, { method: 'DELETE' });
+                const req = await fetch(`/jobs/${jobId}`, { method: 'DELETE' });
+                if (!req.ok) {
+                    const data = await req.json().catch(() => ({}));
+                    const detail = data?.detail;
+                    const msg = Array.isArray(detail) ? detail.join(', ') : (detail || 'Failed to delete job.');
+                    this.showToast(msg, true);
+                    return;
+                }
+                this.showToast(`Deleted ${jobId}`, false);
                 this.poll();
             }
         }).mount()
