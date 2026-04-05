@@ -94,11 +94,10 @@ def test_delete_pod_ignores_api_errors(controller_module, monkeypatch):
 
     monkeypatch.setattr(controller_module, "core", FailingDeleteCore())
 
-    # No exception should escape when pod deletion fails.
     controller_module.delete_pod("job-x")
 
 
-def test_run_transitions_queued_job_to_running(controller_module, monkeypatch, tmp_path):
+def test_run_once_transitions_queued_job_to_running(controller_module, monkeypatch, tmp_path):
     db_path = tmp_path / "jobs.db"
     _create_controller_db(
         db_path,
@@ -123,20 +122,20 @@ def test_run_transitions_queued_job_to_running(controller_module, monkeypatch, t
 
     monkeypatch.setattr(controller_module, "db", _db_factory(db_path))
     monkeypatch.setattr(controller_module, "launch_pod", fake_launch)
-    monkeypatch.setattr(controller_module.time, "sleep", lambda _seconds: (_ for _ in ()).throw(StopIteration))
 
-    with pytest.raises(StopIteration):
-        controller_module.run()
+    controller_module.run_once()
 
     conn = sqlite3.connect(db_path)
-    row = conn.execute("SELECT status, pod_name FROM jobs WHERE id = 'queued01'").fetchone()
+    row = conn.execute("SELECT status, pod_name, updated_at FROM jobs WHERE id = 'queued01'").fetchone()
     conn.close()
 
     assert launched and launched[0][0] == "queued01"
-    assert row == ("running", "job-queued01")
+    assert row[0] == "running"
+    assert row[1] == "job-queued01"
+    assert row[2] is not None
 
 
-def test_run_marks_succeeded_job_complete(controller_module, monkeypatch, tmp_path):
+def test_run_once_marks_succeeded_job_complete_and_writes_logs(controller_module, monkeypatch, tmp_path):
     db_path = tmp_path / "jobs.db"
     _create_controller_db(
         db_path,
@@ -156,21 +155,13 @@ def test_run_marks_succeeded_job_complete(controller_module, monkeypatch, tmp_pa
 
     deleted = []
 
-    def fake_delete(job_id):
-        deleted.append(job_id)
-
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "logs").mkdir(exist_ok=True)
-
-    core = CoreCapture()
-    monkeypatch.setattr(controller_module, "core", core)
     monkeypatch.setattr(controller_module, "db", _db_factory(db_path))
+    monkeypatch.setattr(controller_module, "core", CoreCapture())
+    monkeypatch.setattr(controller_module, "LOG_DIR", tmp_path / "logs")
     monkeypatch.setattr(controller_module, "pod_phase", lambda _job_id: "Succeeded")
-    monkeypatch.setattr(controller_module, "delete_pod", fake_delete)
-    monkeypatch.setattr(controller_module.time, "sleep", lambda _seconds: (_ for _ in ()).throw(StopIteration))
+    monkeypatch.setattr(controller_module, "delete_pod", lambda job_id: deleted.append(job_id))
 
-    with pytest.raises(StopIteration):
-        controller_module.run()
+    controller_module.run_once()
 
     conn = sqlite3.connect(db_path)
     row = conn.execute("SELECT status FROM jobs WHERE id = 'running01'").fetchone()
@@ -179,3 +170,143 @@ def test_run_marks_succeeded_job_complete(controller_module, monkeypatch, tmp_pa
     assert row == ("complete",)
     assert deleted == ["running01"]
     assert (tmp_path / "logs" / "job-running01.log").exists()
+
+
+def test_run_once_requeues_failed_pod_and_applies_fix(controller_module, monkeypatch, tmp_path):
+    db_path = tmp_path / "jobs.db"
+    _create_controller_db(
+        db_path,
+        [
+            (
+                "running02",
+                "running",
+                json.dumps({"model": "resnet", "epochs": 1, "lr": 0.1, "dataset": "mnist"}),
+                "{}",
+                0,
+                "job-running02",
+                None,
+                None,
+            )
+        ],
+    )
+
+    deleted = []
+    fixed = []
+
+    monkeypatch.setattr(controller_module, "db", _db_factory(db_path))
+    monkeypatch.setattr(controller_module, "core", CoreCapture())
+    monkeypatch.setattr(controller_module, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(controller_module, "MAX_JOB_RETRIES", 2)
+    monkeypatch.setattr(controller_module, "pod_phase", lambda _job_id: "Failed")
+    monkeypatch.setattr(controller_module, "delete_pod", lambda job_id: deleted.append(job_id))
+    monkeypatch.setattr(controller_module, "_attempt_fix", lambda job_id: fixed.append(job_id))
+
+    controller_module.run_once()
+
+    conn = sqlite3.connect(db_path)
+    row = conn.execute("SELECT status, retries, pod_name FROM jobs WHERE id = 'running02'").fetchone()
+    conn.close()
+
+    assert deleted == ["running02"]
+    assert fixed == ["running02"]
+    assert row == ("queued", 1, None)
+
+
+def test_run_once_marks_failed_when_retry_budget_exhausted(controller_module, monkeypatch, tmp_path):
+    db_path = tmp_path / "jobs.db"
+    _create_controller_db(
+        db_path,
+        [
+            (
+                "running03",
+                "running",
+                json.dumps({"model": "resnet", "epochs": 1, "lr": 0.1, "dataset": "mnist"}),
+                "{}",
+                2,
+                "job-running03",
+                None,
+                None,
+            )
+        ],
+    )
+
+    monkeypatch.setattr(controller_module, "db", _db_factory(db_path))
+    monkeypatch.setattr(controller_module, "core", CoreCapture())
+    monkeypatch.setattr(controller_module, "MAX_JOB_RETRIES", 2)
+    monkeypatch.setattr(controller_module, "pod_phase", lambda _job_id: "Failed")
+    monkeypatch.setattr(controller_module, "delete_pod", lambda _job_id: None)
+    monkeypatch.setattr(controller_module, "_attempt_fix", lambda _job_id: None)
+
+    controller_module.run_once()
+
+    conn = sqlite3.connect(db_path)
+    row = conn.execute("SELECT status, retries, pod_name FROM jobs WHERE id = 'running03'").fetchone()
+    conn.close()
+
+    assert row == ("failed", 3, None)
+
+
+def test_run_once_requeues_when_running_pod_is_missing(controller_module, monkeypatch, tmp_path):
+    db_path = tmp_path / "jobs.db"
+    _create_controller_db(
+        db_path,
+        [
+            (
+                "running04",
+                "running",
+                json.dumps({"model": "resnet", "epochs": 1, "lr": 0.1, "dataset": "mnist"}),
+                "{}",
+                0,
+                "job-running04",
+                None,
+                None,
+            )
+        ],
+    )
+
+    monkeypatch.setattr(controller_module, "db", _db_factory(db_path))
+    monkeypatch.setattr(controller_module, "core", CoreCapture())
+    monkeypatch.setattr(controller_module, "MAX_JOB_RETRIES", 2)
+    monkeypatch.setattr(controller_module, "pod_phase", lambda _job_id: None)
+
+    controller_module.run_once()
+
+    conn = sqlite3.connect(db_path)
+    row = conn.execute("SELECT status, retries, pod_name FROM jobs WHERE id = 'running04'").fetchone()
+    conn.close()
+
+    assert row == ("queued", 1, None)
+
+
+def test_run_once_handles_launch_errors_with_retry(controller_module, monkeypatch, tmp_path):
+    db_path = tmp_path / "jobs.db"
+    _create_controller_db(
+        db_path,
+        [
+            (
+                "queued02",
+                "queued",
+                json.dumps({"model": "resnet", "epochs": 1, "lr": 0.1, "dataset": "mnist"}),
+                "{}",
+                0,
+                None,
+                None,
+                None,
+            )
+        ],
+    )
+
+    def failing_launch(_job_id, _image, _config):
+        raise RuntimeError("k8s unavailable")
+
+    monkeypatch.setattr(controller_module, "db", _db_factory(db_path))
+    monkeypatch.setattr(controller_module, "launch_pod", failing_launch)
+    monkeypatch.setattr(controller_module, "MAX_JOB_RETRIES", 1)
+
+    controller_module.run_once()
+
+    conn = sqlite3.connect(db_path)
+    row = conn.execute("SELECT status, retries FROM jobs WHERE id = 'queued02'").fetchone()
+    conn.close()
+
+    assert row == ("queued", 1)
