@@ -10,7 +10,7 @@ These scripts provide repeatable checks for reliability-demo scenarios.
 
 ## Scripts
 - `01_bad_input_check.sh`: verifies bad input returns JSON error payloads.
-- `02_api_restart_recovery.sh`: kills API container and confirms health recovery.
+- `02_api_restart_recovery.sh`: attempts in-container process crash, then verifies recovery (falls back to controlled restart when auto-restart cannot be observed on local runtime).
 - `03_worker_pod_kill_recovery.sh`: kills worker pod and checks job status transition.
 - `04_checkpoint_resume_check.sh`: verifies checkpoint-resume behavior after pod kill.
 
