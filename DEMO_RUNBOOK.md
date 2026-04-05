@@ -12,6 +12,10 @@ python -m controller.controller
 ```bash
 docker build -t distributed-trainer-worker:latest .
 ```
+CPU-first build is the default for faster local setup. For CUDA wheels explicitly:
+```bash
+docker build --build-arg REQUIREMENTS_FILE=requirements-gpu-cu124.txt -t distributed-trainer-worker:latest .
+```
 3. Confirm health:
 ```bash
 curl -sS http://127.0.0.1:8000/health

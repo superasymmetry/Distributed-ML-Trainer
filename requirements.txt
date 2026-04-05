@@ -1,11 +1,9 @@
---extra-index-url https://download.pytorch.org/whl/cu124
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
 
+# Default dependency set is CPU-first for faster local builds.
 torch>=2.4.0
 torchvision
 timm
-kubernetes
-groq
-python-dotenv
-fastapi
-uvicorn
-python-multipart
+
+-r requirements-common.txt

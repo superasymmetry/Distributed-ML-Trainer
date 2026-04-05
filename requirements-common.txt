@@ -1,0 +1,6 @@
+kubernetes
+groq
+python-dotenv
+fastapi
+uvicorn
+python-multipart
