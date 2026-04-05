@@ -46,24 +46,28 @@ class JobConfig(BaseModel):
     dataset: str
     epochs: int
     lr: float
-    code: str
+    code: str = ""
 
 def validate_config(config: JobConfig):
-    model = config.get("model")
-    epochs = config.get("epochs")
-    lr = config.get("lr")
-    dataset = config.get("dataset")
+    errors = []
 
-    if not model or not isinstance(model, str):
-        raise HTTPException(status_code=400, detail="Model name must be a non-empty string")
-    if not isinstance(epochs, int) or epochs <= 0:
-        raise HTTPException(status_code=400, detail="Epochs must be a positive integer")
-    if not isinstance(lr, (int, float)) or lr <= 0:
-        raise HTTPException(status_code=400, detail="Learning rate must be a positive number")
-    if not dataset or not isinstance(dataset, str):
-        raise HTTPException(status_code=400, detail="Dataset name must be a non-empty string")
-    if not timm.is_model(config.model):
-        raise HTTPException(status_code=400, detail=f"Model {config.model} not found in timm library")
+    if not config.model or not isinstance(config.model, str):
+        errors.append("Model name must be a non-empty string")
+    elif not timm.is_model(config.model):
+        suggestions = timm.list_models(config.model + "*")[:3]
+        hint = f" Did you mean: {suggestions}?" if suggestions else ""
+        errors.append(f"Model '{config.model}' not found in timm library.{hint}")
+
+    if not isinstance(config.epochs, int) or config.epochs <= 0:
+        errors.append("Epochs must be a positive integer")
+
+    if not isinstance(config.lr, (int, float)) or config.lr <= 0:
+        errors.append("Learning rate must be a positive number")
+
+    if not config.dataset or not isinstance(config.dataset, str):
+        errors.append("Dataset name must be a non-empty string")
+
+    return errors  # empty list = valid
 
 @app.get("/", response_class=HTMLResponse)
 def root():
@@ -108,9 +112,13 @@ def root():
 
 @app.post("/jobs")
 def submit_job(config: JobConfig):
+    errors = validate_config(config)
+    if errors:
+        raise HTTPException(status_code=400, detail=errors)
+
     job_id = str(uuid.uuid4())[:8]
     conn, cursor = connect_db()
-    if config.code is None:
+    if not config.code:
         with open("worker/train_code.txt") as f:
             config.code = f.read()
     cursor.execute("INSERT INTO jobs (id, status, config, metrics) VALUES (?, 'queued', ?, '{}')",
@@ -139,7 +147,7 @@ def get_job(job_id: str):
     return job
 
 @app.delete("/jobs/{job_id}")
-def delete_job(job_id: str = None, ):
+def delete_job(job_id: str = None):
     conn, cursor = connect_db()
     cursor.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
     conn.commit()
@@ -242,22 +250,71 @@ def submit_page():
     return """
     <title>New Job</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @keyframes slide-in {
+            from { transform: translateX(120%); opacity: 0; }
+            to   { transform: translateX(0);   opacity: 1; }
+        }
+        @keyframes slide-out {
+            from { transform: translateX(0);   opacity: 1; }
+            to   { transform: translateX(120%); opacity: 0; }
+        }
+        .toast-enter { animation: slide-in 0.3s ease forwards; }
+        .toast-exit  { animation: slide-out 0.3s ease forwards; }
+    </style>
     <script type="module">
         import { createApp } from 'https://unpkg.com/petite-vue?module'
         createApp({
-            model: 'test_efficientnet.r160_in1k', dataset: 'mnist', epochs: 10, lr: 0.01, loading: false, msg: '',
+            model: 'test_efficientnet.r160_in1k', dataset: 'mnist', epochs: 10, lr: 0.01,
+            loading: false, toasts: [],
+            showToast(msg, isError) {
+                const id = Date.now() + Math.random();
+                this.toasts.push({ id, msg, isError, exiting: false });
+                setTimeout(() => {
+                    const t = this.toasts.find(t => t.id === id);
+                    if (t) t.exiting = true;
+                    setTimeout(() => { this.toasts = this.toasts.filter(t => t.id !== id); }, 300);
+                }, isError ? 5000 : 2000);
+            },
+            showToasts(msgs, isError) {
+                msgs.forEach((msg, i) => setTimeout(() => this.showToast(msg, isError), i * 150));
+            },
             async submit() {
                 this.loading = true;
-                const req = await fetch('/jobs', { 
-                    method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ model: this.model, dataset: this.dataset, epochs: this.epochs, lr: this.lr })
-                });
-                this.msg = req.ok ? 'Job queued!' : 'Error submitting.';
-                setTimeout(() => window.location.href='/dashboard', 1000);
+                try {
+                    const req = await fetch('/jobs', {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ model: this.model, dataset: this.dataset, epochs: this.epochs, lr: this.lr, code: '' })
+                    });
+                    if (req.ok) {
+                        this.showToast('Job queued successfully!', false);
+                        setTimeout(() => window.location.href = '/dashboard', 1200);
+                    } else {
+                        const data = await req.json().catch(() => ({}));
+                        const detail = data?.detail;
+                        const msgs = Array.isArray(detail) ? detail : [detail ?? 'Error submitting job.'];
+                        this.showToasts(msgs, true);
+                    }
+                } catch (e) {
+                    this.showToast('Network error. Is the API running?', true);
+                }
+                this.loading = false;
             }
         }).mount()
     </script>
+
     <body v-scope class="bg-gray-50 flex items-center justify-center h-screen font-sans">
+
+        <!-- Toasts -->
+        <div class="fixed top-6 right-6 z-50 flex flex-col gap-2">
+            <div v-for="t in toasts" :key="t.id"
+                 :class="[t.isError ? 'bg-red-500' : 'bg-green-500', t.exiting ? 'toast-exit' : 'toast-enter']"
+                 class="text-white px-5 py-4 rounded-xl shadow-2xl font-bold text-sm max-w-xs flex items-start gap-3">
+                <span class="text-lg leading-none">{{ t.isError ? '✕' : '✓' }}</span>
+                <span>{{ t.msg }}</span>
+            </div>
+        </div>
+
         <div class="bg-white p-8 rounded-2xl shadow border border-gray-100 max-w-sm w-full">
             <div class="flex justify-between items-center mb-6">
                 <h1 class="text-2xl font-black text-gray-800">New Job</h1>
@@ -270,8 +327,9 @@ def submit_page():
                     <label class="block w-1/2">Epochs <input type="number" v-model="epochs" class="font-normal mt-1 w-full bg-gray-50 border border-gray-200 rounded p-2 focus:ring-2 focus:ring-blue-500 outline-none"></label>
                     <label class="block w-1/2">LR <input type="number" step="0.001" v-model="lr" class="font-normal mt-1 w-full bg-gray-50 border border-gray-200 rounded p-2 focus:ring-2 focus:ring-blue-500 outline-none"></label>
                 </div>
-                <button @click="submit" :disabled="loading" class="w-full bg-blue-600 text-white py-3 rounded-lg hover:bg-blue-700 transition mt-4">{{ loading ? 'Deploying...' : 'Launch Pod' }}</button>
-                <div v-if="msg" class="text-center mt-4 text-blue-600">{{ msg }}</div>
+                <button @click="submit" :disabled="loading" class="w-full bg-blue-600 text-white py-3 rounded-lg hover:bg-blue-700 disabled:opacity-50 transition mt-4 font-bold">
+                    {{ loading ? 'Deploying...' : 'Launch Pod' }}
+                </button>
             </div>
         </div>
     </body>
@@ -282,6 +340,18 @@ def manage_page():
     return """
     <title>Manage Jobs & Data</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @keyframes slide-in {
+            from { transform: translateX(120%); opacity: 0; }
+            to   { transform: translateX(0);   opacity: 1; }
+        }
+        @keyframes slide-out {
+            from { transform: translateX(0);   opacity: 1; }
+            to   { transform: translateX(120%); opacity: 0; }
+        }
+        .toast-enter { animation: slide-in 0.3s ease forwards; }
+        .toast-exit  { animation: slide-out 0.3s ease forwards; }
+    </style>
     <script type="module">
         import { createApp } from 'https://unpkg.com/petite-vue?module'
         
@@ -321,22 +391,47 @@ def manage_page():
             jobs: [],
             newJob: { model: 'test_efficientnet.r160_in1k', dataset: 'mnist', epochs: 10, lr: 0.01 },
             adding: false,
+            toasts: [],
+            showToast(msg, isError) {
+                const id = Date.now() + Math.random();
+                this.toasts.push({ id, msg, isError, exiting: false });
+                setTimeout(() => {
+                    const t = this.toasts.find(t => t.id === id);
+                    if (t) t.exiting = true;
+                    setTimeout(() => { this.toasts = this.toasts.filter(t => t.id !== id); }, 300);
+                }, isError ? 5000 : 2000);
+            },
+            showToasts(msgs, isError) {
+                msgs.forEach((msg, i) => setTimeout(() => this.showToast(msg, isError), i * 150));
+            },
             async poll() {
                 const req = await fetch('/api/dashboard_data');
                 this.jobs = await req.json();
             },
             async submitQuickJob() {
                 this.adding = true;
-                await fetch('/jobs', { 
-                    method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        model: this.newJob.model, dataset: this.newJob.dataset, 
-                        epochs: parseInt(this.newJob.epochs), lr: parseFloat(this.newJob.lr),
-                        code: '' // include empty code field to match schema
-                    })
-                });
+                try {
+                    const req = await fetch('/jobs', { 
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            model: this.newJob.model, dataset: this.newJob.dataset, 
+                            epochs: parseInt(this.newJob.epochs), lr: parseFloat(this.newJob.lr),
+                            code: ''
+                        })
+                    });
+                    if (req.ok) {
+                        this.showToast('Job queued!', false);
+                        this.poll();
+                    } else {
+                        const data = await req.json().catch(() => ({}));
+                        const detail = data?.detail;
+                        const msgs = Array.isArray(detail) ? detail : [detail ?? 'Error submitting job.'];
+                        this.showToasts(msgs, true);
+                    }
+                } catch (e) {
+                    this.showToast('Network error. Is the API running?', true);
+                }
                 this.adding = false;
-                this.poll();
             },
             async deleteJob(jobId) {
                 if(!confirm(`Delete job ${jobId}?`)) return;
@@ -346,13 +441,24 @@ def manage_page():
         }).mount()
     </script>
     <body v-scope @vue:mounted="poll()" class="bg-gray-50 flex justify-center p-10 font-sans min-h-screen">
+
+        <!-- Toasts -->
+        <div class="fixed top-6 right-6 z-50 flex flex-col gap-2">
+            <div v-for="t in toasts" :key="t.id"
+                 :class="[t.isError ? 'bg-red-500' : 'bg-green-500', t.exiting ? 'toast-exit' : 'toast-enter']"
+                 class="text-white px-5 py-4 rounded-xl shadow-2xl font-bold text-sm max-w-xs flex items-start gap-3">
+                <span class="text-lg leading-none">{{ t.isError ? '✕' : '✓' }}</span>
+                <span>{{ t.msg }}</span>
+            </div>
+        </div>
+
         <div class="w-full max-w-4xl bg-white p-8 rounded-2xl shadow border border-gray-100 h-fit">
             <div class="flex justify-between items-center mb-6">
                 <h1 class="text-3xl font-black text-gray-800">Manage Jobs & Data</h1>
                 <a href="/" class="text-blue-500 font-bold hover:underline">← Home</a>
             </div>
             
-            <!-- NEW: Dataset Upload Section -->
+            <!-- Dataset Upload Section -->
             <div class="mb-8 p-4 bg-blue-50 border border-blue-100 rounded-lg" v-scope="FileManager()">
                 <h2 class="text-lg font-bold text-blue-900 mb-2">Upload Custom Dataset</h2>
                 <div class="flex items-center gap-4">
@@ -367,7 +473,7 @@ def manage_page():
                 <div class="mt-2" v-html="uploadStatus"></div>
             </div>
 
-            <!-- Existing Job Submission Row -->
+            <!-- Job Submission Row -->
             <div class="flex gap-2 mb-6 bg-gray-50 p-3 rounded-lg border text-sm items-center">
                 <input v-model="newJob.model" class="border p-2 rounded flex-1 outline-none" placeholder="Model">
                 <input v-model="newJob.dataset" class="border p-2 rounded flex-1 outline-none" placeholder="Dataset">
@@ -378,7 +484,7 @@ def manage_page():
                 </button>
             </div>
 
-            <!-- Existing Jobs Table -->
+            <!-- Jobs Table -->
             <table class="w-full text-left border-collapse">
                 <tr class="border-b-2 text-gray-500 uppercase text-xs tracking-wider">
                     <th class="py-3 px-2">Job ID</th><th class="py-3 px-2">Status</th><th class="py-3 px-2 text-right">Action</th>
