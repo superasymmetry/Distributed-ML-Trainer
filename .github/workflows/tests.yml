@@ -8,7 +8,7 @@ jobs:
 
     steps:
     - uses: actions/checkout@v2
-    - name: Set up Python 3.8
+    - name: Set up Python 3.13
       uses: actions/setup-python@v2
       with:
         python-version: '3.13'
@@ -19,8 +19,26 @@ jobs:
         pip install pytest httpx fastapi pytest-cov
     - name: Start API server
       run: |
-        uvicorn main:app --host 127.0.0.1 --port 8000 &
-        sleep 5
+        uvicorn main:app --host 127.0.0.1 --port 8000 > /tmp/trainctl-api.log 2>&1 &
+        echo $! > /tmp/trainctl-api.pid
+    - name: Wait for API health
+      run: |
+        for i in {1..30}; do
+          if curl -fsS http://127.0.0.1:8000/health >/dev/null; then
+            echo "API is healthy"
+            exit 0
+          fi
+          sleep 1
+        done
+        echo "API failed to become healthy in time"
+        cat /tmp/trainctl-api.log || true
+        exit 1
     - name: Run tests
       run: |
-        pytest --cov=. tests/
+        pytest --cov=. --cov-fail-under=60 tests/
+    - name: Stop API server
+      if: always()
+      run: |
+        if [ -f /tmp/trainctl-api.pid ]; then
+          kill "$(cat /tmp/trainctl-api.pid)" || true
+        fi
