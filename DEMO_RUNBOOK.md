@@ -52,8 +52,18 @@ Expected:
 - Checkpoint file exists before pod kill.
 - After restart, worker logs show `resumed from checkpoint ...`.
 
+### Optional Scalability Clip (for Top Scalability category)
+```bash
+scripts/chaos/05_load_test.sh
+```
+Expected:
+- 50 concurrent `POST /jobs` requests return `200`.
+- Script prints p50/p99 latency.
+- `/health` remains `200` after load.
+
 ## Demo Artifacts to Capture
 - Terminal output from each script.
 - `docker ps` evidence of API restart.
 - `kubectl get pods` and `kubectl logs` snippets for worker recovery.
+- Load-test output with p50/p99 latency.
 - Link to `FAILURE_MODES.md` in submission.

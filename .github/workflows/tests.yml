@@ -33,13 +33,13 @@ jobs:
     - name: Wait for API health
       run: |
         for i in {1..30}; do
-          if curl -fsS http://127.0.0.1:8000/health >/dev/null; then
-            echo "API is healthy"
+          if curl -fsS http://127.0.0.1:8000/readyz >/dev/null; then
+            echo "API is ready"
             exit 0
           fi
           sleep 1
         done
-        echo "API failed to become healthy in time"
+        echo "API failed to become ready in time"
         cat /tmp/trainctl-api.log || true
         exit 1
     - name: Run tests
