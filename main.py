@@ -1,7 +1,10 @@
 import os
+import re
 import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from kubernetes import client, config
@@ -11,6 +14,9 @@ import json
 import timm
 
 app = FastAPI()
+DEFAULT_TRAINING_CODE_PATH = Path("worker") / "train_code.txt"
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads"))
+SAFE_UPLOAD_FILENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def connect_db(PATH="jobs.db"):
@@ -41,30 +47,54 @@ def init_db():
 init_db()
 
 
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def resolve_training_code(code: str | None) -> str:
+    if code and code.strip():
+        return code
+
+    if not DEFAULT_TRAINING_CODE_PATH.exists():
+        raise HTTPException(status_code=500, detail="Default training code file is missing")
+
+    try:
+        return DEFAULT_TRAINING_CODE_PATH.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to read default training code: {exc}",
+        ) from exc
+
+
 class JobConfig(BaseModel):
     model: str
     dataset: str
     epochs: int
     lr: float
-    code: str = ""
+    code: str | None = None
 
-def validate_config(config: JobConfig):
+def validate_config(job_config: JobConfig):
     errors = []
+    model_name = job_config.model.strip() if isinstance(job_config.model, str) else ""
+    dataset_name = job_config.dataset.strip() if isinstance(job_config.dataset, str) else ""
 
-    if not config.model or not isinstance(config.model, str):
+    if not model_name:
         errors.append("Model name must be a non-empty string")
-    elif not timm.is_model(config.model):
-        suggestions = timm.list_models(config.model + "*")[:3]
+    elif not timm.is_model(model_name):
+        suggestions = []
+        if hasattr(timm, "list_models"):
+            suggestions = timm.list_models(model_name + "*")[:3]
         hint = f" Did you mean: {suggestions}?" if suggestions else ""
-        errors.append(f"Model '{config.model}' not found in timm library.{hint}")
+        errors.append(f"Model '{model_name}' not found in timm library.{hint}")
 
-    if not isinstance(config.epochs, int) or config.epochs <= 0:
+    if not isinstance(job_config.epochs, int) or job_config.epochs <= 0:
         errors.append("Epochs must be a positive integer")
 
-    if not isinstance(config.lr, (int, float)) or config.lr <= 0:
+    if not isinstance(job_config.lr, (int, float)) or job_config.lr <= 0:
         errors.append("Learning rate must be a positive number")
 
-    if not config.dataset or not isinstance(config.dataset, str):
+    if not dataset_name:
         errors.append("Dataset name must be a non-empty string")
 
     return errors  # empty list = valid
@@ -117,12 +147,21 @@ def submit_job(config: JobConfig):
         raise HTTPException(status_code=400, detail=errors)
 
     job_id = str(uuid.uuid4())[:8]
+    code = resolve_training_code(config.code)
+    config_payload = config.model_dump()
+    config_payload["model"] = config.model.strip()
+    config_payload["dataset"] = config.dataset.strip()
+    config_payload["code"] = code
+    now = utc_now_iso()
+
     conn, cursor = connect_db()
-    if not config.code:
-        with open("worker/train_code.txt") as f:
-            config.code = f.read()
-    cursor.execute("INSERT INTO jobs (id, status, config, metrics) VALUES (?, 'queued', ?, '{}')",
-                   (job_id, config.model_dump_json()))
+    cursor.execute(
+        """
+        INSERT INTO jobs (id, status, config, metrics, created_at, updated_at)
+        VALUES (?, 'queued', ?, '{}', ?, ?)
+        """,
+        (job_id, json.dumps(config_payload), now, now),
+    )
     conn.commit()
     conn.close()
     return {"job_id": job_id}
@@ -211,6 +250,43 @@ def dashboard_data():
             "created_at": job[3] or "-"
         })
     return result
+
+
+@app.post("/api/upload")
+async def upload_dataset(file: UploadFile = File(...)):
+    raw_filename = (file.filename or "").strip()
+    filename = os.path.basename(raw_filename)
+    if not filename:
+        raise HTTPException(status_code=400, detail="Uploaded file must include a filename")
+    if raw_filename != filename or "/" in raw_filename or "\\" in raw_filename:
+        raise HTTPException(status_code=400, detail="Filename must not include path separators")
+    if filename in {".", ".."} or not SAFE_UPLOAD_FILENAME.fullmatch(filename):
+        raise HTTPException(
+            status_code=400,
+            detail="Filename may contain only letters, numbers, dots, underscores, and hyphens",
+        )
+
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    destination = UPLOAD_DIR / filename
+
+    try:
+        content = await file.read()
+    finally:
+        await file.close()
+
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    try:
+        destination.write_bytes(content)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to store upload: {exc}") from exc
+
+    return {
+        "filename": filename,
+        "path": str(destination),
+        "size_bytes": len(content),
+    }
     
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
@@ -378,13 +454,21 @@ def manage_page():
                         method: 'POST',
                         body: formData
                     })
-                    .then(response => response.json())
+                    .then(async response => {
+                        const data = await response.json().catch(() => ({}));
+                        if (!response.ok) {
+                            const detail = data?.detail;
+                            const message = Array.isArray(detail) ? detail.join(', ') : (detail || 'Upload failed.');
+                            throw new Error(message);
+                        }
+                        return data;
+                    })
                     .then(data => {
                         this.uploadStatus = `<span class="text-green-600 font-bold text-sm">Successfully uploaded ${data.filename}!</span>`;
                         fileInput.value = ''; 
                     })
                     .catch(error => {
-                        this.uploadStatus = `<span class="text-red-500 font-bold text-sm">Upload failed: ${error}</span>`;
+                        this.uploadStatus = `<span class="text-red-500 font-bold text-sm">Upload failed: ${error.message}</span>`;
                     });
                 }
             }
