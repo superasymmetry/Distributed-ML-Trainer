@@ -162,8 +162,12 @@ def health():
             config.load_kube_config()
 
         api_client = client.ApiClient()
-        livez_res = api_client.call_api("/livez", "GET", _preload_content=False)
-        readyz_res = api_client.call_api("/readyz", "GET", _preload_content=False)
+        livez_res = api_client.call_api(
+            "/livez", "GET", _preload_content=False, _request_timeout=1
+        )
+        readyz_res = api_client.call_api(
+            "/readyz", "GET", _preload_content=False, _request_timeout=1
+        )
         health_status["kubernetes"] = {
             "livez": livez_res[1],
             "readyz": readyz_res[1]
