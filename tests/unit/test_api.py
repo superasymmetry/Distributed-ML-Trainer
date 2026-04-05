@@ -64,6 +64,34 @@ def test_get_job_missing_returns_404(api_client):
     assert response.json()["detail"] == "Job not found"
 
 
+def test_list_jobs_empty_returns_empty_list(api_client):
+    response = api_client.get("/jobs")
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_list_jobs_row_shape(api_client):
+    payload = {
+        "model": "test_efficientnet.r160_in1k",
+        "dataset": "mnist",
+        "epochs": 1,
+        "lr": 0.01,
+        "code": "pass",
+    }
+    job_id = api_client.post("/jobs", json=payload).json()["job_id"]
+
+    response = api_client.get("/jobs")
+    assert response.status_code == 200
+
+    rows = response.json()
+    assert len(rows) == 1
+    assert isinstance(rows[0], list)
+    assert len(rows[0]) == 8
+    assert rows[0][0] == job_id
+    assert rows[0][1] == "queued"
+
+
 def test_delete_job_removes_record(api_client, temp_jobs_db):
     payload = {
         "model": "test_efficientnet.r160_in1k",
@@ -113,6 +141,48 @@ def test_dashboard_data_formats_metrics(api_client, temp_jobs_db):
     assert body[0]["status"] == "RUNNING"
     assert body[0]["epoch"] == 2
     assert body[0]["last_loss"] == "0.6300"
+
+
+def test_dashboard_data_empty_returns_empty_list(api_client):
+    response = api_client.get("/api/dashboard_data")
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_dashboard_data_sorted_desc_by_created_at(api_client, temp_jobs_db):
+    conn = sqlite3.connect(temp_jobs_db)
+    row_config = json.dumps(
+        {
+            "model": "test_efficientnet.r160_in1k",
+            "dataset": "mnist",
+            "epochs": 1,
+            "lr": 0.01,
+            "code": "pass",
+        }
+    )
+    conn.execute(
+        """
+        INSERT INTO jobs (id, status, config, metrics, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        ("older000", "queued", row_config, "{}", "2026-04-05T09:00:00Z"),
+    )
+    conn.execute(
+        """
+        INSERT INTO jobs (id, status, config, metrics, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        ("newer000", "queued", row_config, "{}", "2026-04-05T10:00:00Z"),
+    )
+    conn.commit()
+    conn.close()
+
+    response = api_client.get("/api/dashboard_data")
+    assert response.status_code == 200
+
+    body = response.json()
+    assert [body[0]["id"], body[1]["id"]] == ["newer000", "older000"]
 
 
 def test_health_uses_kube_fallback(main_module, api_client, monkeypatch):
