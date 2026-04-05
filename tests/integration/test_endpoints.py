@@ -1,5 +1,7 @@
 import json
+import os
 import sqlite3
+from datetime import datetime
 
 import httpx
 import pytest
@@ -64,6 +66,36 @@ def test_submit_job_integration():
 
     assert row is not None
     assert json.loads(row[0])["model"] == VALID_MODEL
+
+    httpx.delete(f"{BASE_URL}/jobs/{job_id}")
+
+
+def test_submit_job_without_code_sets_default_code_and_timestamps():
+    payload = {
+        "model": VALID_MODEL,
+        "dataset": "mnist",
+        "epochs": 1,
+        "lr": 0.02,
+    }
+
+    response = httpx.post(f"{BASE_URL}/jobs", json=payload)
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT config, created_at, updated_at FROM jobs WHERE id = ?",
+        (job_id,),
+    ).fetchone()
+    conn.close()
+
+    assert row is not None
+    persisted_config = json.loads(row[0])
+    assert persisted_config["code"].strip() != ""
+    assert row[1] is not None
+    assert row[2] is not None
+    datetime.fromisoformat(row[1])
+    datetime.fromisoformat(row[2])
 
     httpx.delete(f"{BASE_URL}/jobs/{job_id}")
 
@@ -194,6 +226,31 @@ def test_submit_job_invalid_model_rejected_integration():
 
     assert response.status_code == 400
     assert "detail" in response.json()
+
+
+def test_upload_dataset_integration():
+    response = httpx.post(
+        f"{BASE_URL}/api/upload",
+        files={"file": ("integration_dataset.csv", b"a,b\n1,2\n", "text/csv")},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["filename"] == "integration_dataset.csv"
+    assert body["size_bytes"] == len(b"a,b\n1,2\n")
+    assert os.path.exists(body["path"])
+
+    os.remove(body["path"])
+
+
+def test_upload_dataset_invalid_filename_rejected_integration():
+    response = httpx.post(
+        f"{BASE_URL}/api/upload",
+        files={"file": ("../bad.csv", b"a,b\n1,2\n", "text/csv")},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Filename must not include path separators"
 
 
 def test_dashboard_data_handles_invalid_metrics_json_integration():

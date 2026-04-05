@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from datetime import datetime
 
 import pytest
 
@@ -40,6 +41,55 @@ def test_submit_job_persists_config(api_client, temp_jobs_db):
     assert persisted_config["code"] == payload["code"]
 
 
+def test_submit_job_without_code_uses_default_training_code(api_client, main_module, temp_jobs_db, tmp_path):
+    default_code_path = tmp_path / "train_code.py"
+    default_code_path.write_text("print('default training code')", encoding="utf-8")
+    main_module.DEFAULT_TRAINING_CODE_PATH = default_code_path
+
+    payload = {
+        "model": "test_efficientnet.r160_in1k",
+        "dataset": "mnist",
+        "epochs": 3,
+        "lr": 0.01,
+    }
+    response = api_client.post("/jobs", json=payload)
+
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+
+    conn = sqlite3.connect(temp_jobs_db)
+    row = conn.execute("SELECT config FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    conn.close()
+
+    assert row is not None
+    persisted_config = json.loads(row[0])
+    assert persisted_config["code"] == "print('default training code')"
+
+
+def test_submit_job_writes_created_and_updated_timestamps(api_client, temp_jobs_db):
+    payload = {
+        "model": "test_efficientnet.r160_in1k",
+        "dataset": "mnist",
+        "epochs": 1,
+        "lr": 0.01,
+        "code": "pass",
+    }
+    response = api_client.post("/jobs", json=payload)
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+
+    conn = sqlite3.connect(temp_jobs_db)
+    row = conn.execute("SELECT created_at, updated_at FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    conn.close()
+
+    assert row is not None
+    assert row[0] is not None
+    assert row[1] is not None
+    datetime.fromisoformat(row[0])
+    datetime.fromisoformat(row[1])
+    assert row[0] == row[1]
+
+
 def test_submit_job_invalid_payload_returns_json_error(api_client):
     payload = {
         "model": "test_efficientnet.r160_in1k",
@@ -55,6 +105,49 @@ def test_submit_job_invalid_payload_returns_json_error(api_client):
     body = response.json()
     assert "detail" in body
     assert isinstance(body["detail"], list)
+
+
+def test_submit_job_rejects_blank_dataset(api_client):
+    payload = {
+        "model": "test_efficientnet.r160_in1k",
+        "dataset": "   ",
+        "epochs": 1,
+        "lr": 0.01,
+        "code": "pass",
+    }
+    response = api_client.post("/jobs", json=payload)
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == ["Dataset name must be a non-empty string"]
+
+
+def test_submit_job_rejects_non_positive_learning_rate(api_client):
+    payload = {
+        "model": "test_efficientnet.r160_in1k",
+        "dataset": "mnist",
+        "epochs": 1,
+        "lr": 0,
+        "code": "pass",
+    }
+    response = api_client.post("/jobs", json=payload)
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == ["Learning rate must be a positive number"]
+
+
+def test_submit_job_missing_default_training_code_returns_json_error(api_client, main_module, tmp_path):
+    main_module.DEFAULT_TRAINING_CODE_PATH = tmp_path / "missing_train_code.py"
+
+    payload = {
+        "model": "test_efficientnet.r160_in1k",
+        "dataset": "mnist",
+        "epochs": 1,
+        "lr": 0.01,
+    }
+    response = api_client.post("/jobs", json=payload)
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Default training code file is missing"
 
 
 def test_get_job_missing_returns_404(api_client):
@@ -205,3 +298,41 @@ def test_health_uses_kube_fallback(main_module, api_client, monkeypatch):
     assert data["api"] == "ok"
     assert data["kubernetes"] == {"livez": 200, "readyz": 200}
     assert calls["fallback_used"] is True
+
+
+def test_upload_dataset_saves_file(api_client, main_module, tmp_path):
+    main_module.UPLOAD_DIR = tmp_path / "uploads"
+
+    response = api_client.post(
+        "/api/upload",
+        files={"file": ("dataset.csv", b"col_a,col_b\n1,2\n", "text/csv")},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["filename"] == "dataset.csv"
+    assert body["size_bytes"] == len(b"col_a,col_b\n1,2\n")
+
+    saved_file = main_module.UPLOAD_DIR / "dataset.csv"
+    assert saved_file.exists()
+    assert saved_file.read_bytes() == b"col_a,col_b\n1,2\n"
+
+
+def test_upload_dataset_rejects_invalid_filename(api_client):
+    response = api_client.post(
+        "/api/upload",
+        files={"file": ("../dataset.csv", b"1,2\n", "text/csv")},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Filename must not include path separators"
+
+
+def test_upload_dataset_rejects_empty_file(api_client):
+    response = api_client.post(
+        "/api/upload",
+        files={"file": ("dataset.csv", b"", "text/csv")},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Uploaded file is empty"
