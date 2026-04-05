@@ -251,6 +251,8 @@ def main_module(monkeypatch, temp_jobs_db: Path):
         return conn, conn.cursor()
 
     monkeypatch.setattr(main, "connect_db", connect_db)
+    monkeypatch.setattr(main, "RATE_LIMIT_ENABLED", False)
+    main.RATE_LIMIT_BUCKETS.clear()
     main.init_db()
     return main
 

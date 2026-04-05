@@ -177,12 +177,14 @@ def test_list_jobs_row_shape(api_client):
     response = api_client.get("/jobs")
     assert response.status_code == 200
 
-    rows = response.json()
-    assert len(rows) == 1
-    assert isinstance(rows[0], list)
-    assert len(rows[0]) == 8
-    assert rows[0][0] == job_id
-    assert rows[0][1] == "queued"
+    jobs = response.json()
+    assert len(jobs) == 1
+    assert isinstance(jobs[0], dict)
+    assert jobs[0]["id"] == job_id
+    assert jobs[0]["status"] == "queued"
+    assert jobs[0]["retries"] == 0
+    assert jobs[0]["config"]["model"] == payload["model"]
+    assert jobs[0]["metrics"] == {}
 
 
 def test_delete_job_removes_record(api_client, temp_jobs_db):
@@ -197,13 +199,47 @@ def test_delete_job_removes_record(api_client, temp_jobs_db):
 
     delete_response = api_client.delete(f"/jobs/{job_id}")
     assert delete_response.status_code == 200
-    assert delete_response.json() == job_id
+    assert delete_response.json() == {"deleted_job_id": job_id}
 
     conn = sqlite3.connect(temp_jobs_db)
     row = conn.execute("SELECT 1 FROM jobs WHERE id = ?", (job_id,)).fetchone()
     conn.close()
 
     assert row is None
+
+
+def test_delete_job_missing_returns_404(api_client):
+    response = api_client.delete("/jobs/doesnotexist")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Job not found"
+
+
+def test_delete_running_job_returns_409(api_client, temp_jobs_db):
+    conn = sqlite3.connect(temp_jobs_db)
+    conn.execute(
+        """
+        INSERT INTO jobs (id, status, config, metrics, retries, pod_name, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "run12345",
+            "running",
+            json.dumps({"model": "test_efficientnet.r160_in1k", "dataset": "mnist", "epochs": 1, "lr": 0.01, "code": "pass"}),
+            "{}",
+            0,
+            "job-run12345",
+            "2026-04-05T10:00:00+00:00",
+            "2026-04-05T10:00:00+00:00",
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    response = api_client.delete("/jobs/run12345")
+
+    assert response.status_code == 409
+    assert "Cannot delete a running job" in response.json()["detail"]
 
 
 def test_dashboard_data_formats_metrics(api_client, temp_jobs_db):
@@ -298,6 +334,116 @@ def test_health_uses_kube_fallback(main_module, api_client, monkeypatch):
     assert data["api"] == "ok"
     assert data["kubernetes"] == {"livez": 200, "readyz": 200}
     assert calls["fallback_used"] is True
+
+
+def test_health_returns_503_when_database_unhealthy(main_module, api_client, monkeypatch):
+    def fail_connect(_path: str = "jobs.db"):
+        raise sqlite3.OperationalError("db down")
+
+    monkeypatch.setattr(main_module, "connect_db", fail_connect)
+
+    response = api_client.get("/health")
+
+    assert response.status_code == 503
+    assert response.json()["database"].startswith("error:")
+
+
+def test_livez_returns_200(api_client):
+    response = api_client.get("/livez")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert "api_version" in body
+
+
+def test_readyz_reports_database_health(main_module, api_client, monkeypatch):
+    response = api_client.get("/readyz")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "database": "ok"}
+
+    def fail_connect(_path: str = "jobs.db"):
+        raise sqlite3.OperationalError("db down")
+
+    monkeypatch.setattr(main_module, "connect_db", fail_connect)
+    unhealthy = api_client.get("/readyz")
+    assert unhealthy.status_code == 503
+    assert unhealthy.json()["status"] == "error"
+    assert unhealthy.json()["database"].startswith("error:")
+
+
+def test_metrics_returns_job_counts(api_client, temp_jobs_db):
+    conn = sqlite3.connect(temp_jobs_db)
+    rows = [
+        ("job-a", "queued"),
+        ("job-b", "running"),
+        ("job-c", "failed"),
+        ("job-d", "complete"),
+        ("job-e", "complete"),
+    ]
+    for job_id, status_value in rows:
+        conn.execute(
+            "INSERT INTO jobs (id, status, config, metrics, retries, pod_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                job_id,
+                status_value,
+                json.dumps({"model": "test_efficientnet.r160_in1k", "dataset": "mnist", "epochs": 1, "lr": 0.01, "code": "pass"}),
+                "{}",
+                0,
+                None,
+                "2026-04-05T10:00:00+00:00",
+                "2026-04-05T10:00:00+00:00",
+            ),
+        )
+    conn.commit()
+    conn.close()
+
+    response = api_client.get("/metrics")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["jobs_total"] == 5
+    assert body["jobs_by_status"]["queued"] == 1
+    assert body["jobs_by_status"]["running"] == 1
+    assert body["jobs_by_status"]["failed"] == 1
+    assert body["jobs_by_status"]["complete"] == 2
+    assert body["uptime_seconds"] >= 0
+    assert "api_version" in body
+
+
+def test_request_id_header_is_included(api_client):
+    response = api_client.get("/health")
+    assert response.status_code == 200
+    assert response.headers["x-request-id"]
+
+    custom = api_client.get("/health", headers={"X-Request-ID": "req-test-123"})
+    assert custom.status_code == 200
+    assert custom.headers["x-request-id"] == "req-test-123"
+
+
+def test_submit_job_rate_limiting(main_module, api_client):
+    main_module.RATE_LIMIT_ENABLED = True
+    main_module.RATE_LIMIT_MAX_REQUESTS = 2
+    main_module.RATE_LIMIT_WINDOW_SECONDS = 60
+    main_module.RATE_LIMIT_BUCKETS.clear()
+
+    payload = {
+        "model": "test_efficientnet.r160_in1k",
+        "dataset": "mnist",
+        "epochs": 1,
+        "lr": 0.01,
+        "code": "pass",
+    }
+    headers = {"X-Forwarded-For": "10.0.0.5"}
+
+    ok_1 = api_client.post("/jobs", json=payload, headers=headers)
+    ok_2 = api_client.post("/jobs", json=payload, headers=headers)
+    limited = api_client.post("/jobs", json=payload, headers=headers)
+
+    assert ok_1.status_code == 200
+    assert ok_2.status_code == 200
+    assert limited.status_code == 429
+    assert "Rate limit exceeded" in limited.json()["detail"]
 
 
 def test_upload_dataset_saves_file(api_client, main_module, tmp_path):
