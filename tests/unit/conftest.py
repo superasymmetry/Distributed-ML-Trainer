@@ -149,11 +149,16 @@ def _install_timm_stub() -> None:
     def is_model(name: str) -> bool:
         return not name.startswith("invalid")
 
+    def list_models(pattern: str):
+        _ = pattern
+        return []
+
     def create_model(_name: str, pretrained: bool = True):
         _ = pretrained
         return DummyModel()
 
     timm.is_model = is_model
+    timm.list_models = list_models
     timm.create_model = create_model
     sys.modules["timm"] = timm
 
