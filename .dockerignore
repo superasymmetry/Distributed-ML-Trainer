@@ -1,0 +1,17 @@
+.git
+.github
+.venv
+.pytest_cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.coverage
+.DS_Store
+jobs.db
+logs
+uploads
+LOCAL_HACKATHON_TRACKER.md
+scripts/chaos/artifacts
+tests
+*.md

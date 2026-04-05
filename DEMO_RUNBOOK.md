@@ -1,76 +1,85 @@
-## Demo Runbook
+# Demo Runbook (2 Minutes)
 
-This is the script for demonstrating AMLED! end to end, including the error handling and self-healing features.
+This runbook is optimized for the hackathon reliability demo.
 
-### Before you start
+## Before Recording
+- Docker Desktop is running.
+- Kubernetes is enabled if you plan to run pod-chaos scripts (`03`/`04`).
+- `kubectl get nodes` shows a ready node (for Kubernetes demos).
+- `python -m controller.controller` will run in a second terminal.
 
-Make sure all of this is true:
-- Docker Desktop is running with Kubernetes enabled
-- `kubectl get nodes` shows a Ready node
-- The worker image is built
-- The PVC exists: `kubectl get pvc trainctl-data`
-- The API is running on port 8000
-- The controller is running in a separate terminal with `python -m controller.controller`
+For full setup, see [README](https://github.com/superasymmetry/Distributed-ML-Trainer/blob/main/README.md).
 
-Open `http://localhost:8000` in a browser.
-
-For more information on how to setup the project, read [the readme](https://github.com/superasymmetry/Distributed-ML-Trainer/blob/main/README.md)
----
-
-### Submit a valid job
-
-1. Click **New Job** from the home page
-2. Leave the defaults (`test_efficientnet.r160_in1k`, `mnist`, 10 epochs, lr 0.01) and click **Launch Pod**
-3. You'll see a green popup of *"Job queued successfully!"* and get redirected to the dashboard
-4. Watch the dashboard — within 5 seconds the status changes from `QUEUED` to `RUNNING`
-5. After the first epoch completes, the epoch counter and loss column start updating
-
----
-
-### Failure demos
-
-Now we will demonstrate how AMLED! recovers upon failure.
-
-Go to `/submit` and try each of these:
-
-**Bad model name:**
-```
-model: resnet999
-```
-Expected: red toast saying the model wasn't found, with suggestions if any close matches exist.
-
-**Negative learning rate:**
-```
-lr: -0.5
-```
-Expected: red toast saying LR must be positive.
-
-**Multiple errors at once:**
-```
-model: fakemodel123
-epochs: -5
-lr: 0
-```
-Expected: three separate red toasts sliding in one after another, one per error. No pod is ever launched.
-
----
-
-**Crash recovery**
-
-While a job is running, kill its pod to simulate a crash. For example (I have a pod, api-1, in the distributed-trainer container):
-
+## Pre-Demo Setup (Off Camera)
+1. Start API and controller:
 ```bash
-docker exec distributed-trainer-api-1 kill 1 
+fastapi dev main.py
+python -m controller.controller
 ```
-<img width="1593" height="901" alt="image" src="https://github.com/user-attachments/assets/11f5e387-7988-4cef-bcb7-0484e2b8bd59" />
+2. Build worker image:
+```bash
+docker build -t distributed-trainer-worker:latest .
+```
+CPU-first build is default for faster local setup. For CUDA wheels explicitly:
+```bash
+docker build --build-arg REQUIREMENTS_FILE=requirements-gpu-cu124.txt -t distributed-trainer-worker:latest .
+```
+3. Confirm health:
+```bash
+curl -sS http://127.0.0.1:8000/health
+curl -sS http://127.0.0.1:8000/readyz
+```
 
-1. The pod disappears
-2. The controller detects the `Failed`/missing pod
-3. The job status resets to `QUEUED`
-4. The container restarts a pod
-5. The worker logs show `"resumed from checkpoint at epoch N"` — it picks up where it left off
+## Demo Sequence
 
-This demonstrates that the PVC-backed checkpointing is working correctly.
+### 0:00-0:10 Intro
+State the required intro clearly:
+`"Hi, this is my demo for the Production Engineering Hackathon."`
 
----
+### 0:10-0:30 Submit Valid Job (UI)
+1. Open `http://127.0.0.1:8000/submit`.
+2. Use defaults (`test_efficientnet.r160_in1k`, `mnist`, `epochs=10`, `lr=0.01`).
+3. Click **Launch Pod** and show redirect to dashboard.
+4. Show status moving from `QUEUED` to `RUNNING`.
 
+### 0:30-0:55 Bad Input -> Clean JSON Error
+```bash
+scripts/chaos/01_bad_input_check.sh
+```
+Expected:
+- Bad requests return clean JSON `detail` errors.
+- API remains healthy.
+
+### 0:55-1:20 Crash API -> Recovery
+```bash
+scripts/chaos/02_api_restart_recovery.sh
+```
+Expected:
+- API process is force-crashed.
+- Service recovers (auto-restart or controlled restart fallback).
+- Health endpoint becomes OK again.
+
+### 1:20-1:50 Load Resilience
+```bash
+REQUESTS=50 CONCURRENCY=10 scripts/chaos/05_load_test.sh
+```
+Expected:
+- 50 concurrent `POST /jobs` requests succeed.
+- Script prints p50/p99 latency.
+- API remains healthy after load.
+
+### Optional Kubernetes Clip (if available)
+```bash
+scripts/chaos/03_worker_pod_kill_recovery.sh
+scripts/chaos/04_checkpoint_resume_check.sh
+```
+Expected:
+- Worker pod kill triggers clean status transition.
+- Checkpoint resume is visible in logs.
+
+## Artifacts to Capture
+- Terminal output from each script.
+- `docker ps` evidence of API restart.
+- `kubectl get pods` and `kubectl logs` (for pod-chaos clips).
+- p50/p99 output from load test.
+- Link to `FAILURE_MODES.md`.

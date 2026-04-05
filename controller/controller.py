@@ -21,6 +21,7 @@ from worker.fixworker import fix
 DB_PATH = os.getenv("DB_PATH", "jobs.db")
 WORKER_IMAGE = os.getenv("WORKER_IMAGE", "distributed-trainer-worker:latest")
 NAMESPACE = os.getenv("K8S_NAMESPACE", "default")
+IMAGE_PULL_POLICY = os.getenv("K8S_IMAGE_PULL_POLICY", "IfNotPresent")
 POLL_INTERVAL_SECONDS = int(os.getenv("CONTROLLER_POLL_SECONDS", "5"))
 MAX_JOB_RETRIES = int(os.getenv("MAX_JOB_RETRIES", "2"))
 TRAIN_CODE_PATH = Path("worker") / "train_code.txt"
@@ -96,7 +97,7 @@ def launch_pod(job_id, image, config: dict):
                 client.V1Container(
                     name="worker",
                     image=image,
-                    image_pull_policy="Never",
+                    image_pull_policy=IMAGE_PULL_POLICY,
                     volume_mounts=[
                         client.V1VolumeMount(
                             name="jobdata",
