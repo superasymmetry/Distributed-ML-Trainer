@@ -44,7 +44,7 @@ jobs:
         exit 1
     - name: Run tests
       run: |
-        pytest --cov=. --cov-fail-under=60 tests/
+        pytest --cov=. --cov-fail-under=70 tests/
     - name: Show API logs on failure
       if: failure()
       run: |
