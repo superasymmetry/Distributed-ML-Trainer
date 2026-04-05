@@ -4,3 +4,4 @@ pycache/
 jobs.db
 logs/
 .venv/
+LOCAL_HACKATHON_TRACKER.md
