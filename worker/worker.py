@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -10,12 +11,17 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
+from logging_utils import configure_json_logging
+
 DB = os.getenv("DB_PATH", "jobs.db")
 MODEL = os.getenv("MODEL", "linear")
 EPOCHS = int(os.getenv("EPOCHS", "10"))
 LR = float(os.getenv("LR", "0.01"))
 DATASET = os.getenv("DATASET", "mnist")
 CHECKPOINT_DIR = Path(os.getenv("CHECKPOINT_DIR", "/data/checkpoints"))
+
+configure_json_logging(service="worker")
+log = logging.getLogger("trainctl.worker")
 
 
 def utc_now_iso() -> str:
@@ -56,7 +62,10 @@ def save_checkpoint(job_id, epoch, model, optimizer, metrics):
         },
         path,
     )
-    print(f"checkpoint saved at epoch {epoch}", flush=True)
+    log.info(
+        "Checkpoint saved",
+        extra={"event": "checkpoint_saved", "job_id": job_id},
+    )
 
 
 def load_checkpoint(job_id, model, optimizer):
@@ -78,19 +87,31 @@ def load_checkpoint(job_id, model, optimizer):
         metrics.setdefault("epoch", epoch)
         metrics.setdefault("status", "training")
 
-        print(f"resumed from checkpoint at epoch {epoch}", flush=True)
+        log.info(
+            "Resumed from checkpoint",
+            extra={"event": "checkpoint_resumed", "job_id": job_id},
+        )
         return epoch, metrics
     except Exception as exc:
-        print(f"failed to load checkpoint from {path}: {exc}", flush=True)
+        log.warning(
+            "Failed to load checkpoint; using defaults",
+            extra={"event": "checkpoint_load_failed", "job_id": job_id},
+        )
         return 0, default_metrics()
 
 
 def train(job_id, model_name, epochs, lr, dataset_name):
     if os.path.exists(model_name):
-        print(f"loading existing model from {model_name}", flush=True)
+        log.info(
+            "Loading existing model path",
+            extra={"event": "model_load_local", "job_id": job_id},
+        )
         model = torch.load(model_name, map_location="cpu")
     else:
-        print(f"using model from timm library {model_name}", flush=True)
+        log.info(
+            "Loading model from timm",
+            extra={"event": "model_load_timm", "job_id": job_id},
+        )
         model = timm.create_model(model_name, pretrained=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -105,8 +126,10 @@ def train(job_id, model_name, epochs, lr, dataset_name):
     metrics.setdefault("epoch", start_epoch)
     metrics["status"] = "training"
 
-    print(f"starting job {job_id} model={model_name} epochs={epochs} lr={lr}", flush=True)
-    print(f"dataset={dataset_name}", flush=True)
+    log.info(
+        "Training started",
+        extra={"event": "training_started", "job_id": job_id},
+    )
 
     train_dataset = datasets.FakeData(
         size=128,
@@ -130,35 +153,36 @@ def train(job_id, model_name, epochs, lr, dataset_name):
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()
-                print(" batch", batch_idx, "loss", loss.item(), flush=True)
 
             avg_loss = total_loss / (batch_idx + 1)
             metrics["loss_history"].append(round(avg_loss, 4))
             metrics["epoch"] = epoch
 
-            print("metrics at epoch", epoch, metrics, flush=True)
             save_checkpoint(job_id, epoch, model, optimizer, metrics)
-            print("saved checkpoint for epoch", epoch, flush=True)
-            print(f"epoch {epoch}/{epochs}  loss={avg_loss:.4f}")
+            log.info(
+                "Epoch complete",
+                extra={"event": "epoch_complete", "job_id": job_id},
+            )
 
         metrics["status"] = "complete"
         write_metrics(metrics, job_id)
-        print(f"job {job_id} complete")
+        log.info("Job complete", extra={"event": "job_complete", "job_id": job_id})
     except Exception as exc:
         metrics["status"] = "failed"
         metrics["error"] = str(exc)
         write_metrics(metrics, job_id)
+        log.error("Training failed", extra={"event": "job_failed", "job_id": job_id})
         raise
 
 
 if __name__ == "__main__":
     job_id = os.getenv("JOB_ID")
     if not job_id:
-        print("No JOB_ID provided, exiting.")
+        log.error("No JOB_ID provided", extra={"event": "missing_job_id"})
         raise SystemExit(1)
 
     try:
         train(job_id, MODEL, EPOCHS, LR, DATASET)
     except Exception as exc:
-        print(f"job {job_id} failed: {exc}", flush=True)
+        log.error("Worker exiting after failure", extra={"event": "worker_exit_failed", "job_id": job_id})
         raise SystemExit(1)

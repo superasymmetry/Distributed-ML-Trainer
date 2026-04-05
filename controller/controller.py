@@ -15,6 +15,7 @@ from pathlib import Path
 
 from kubernetes import client, config as k8s_config
 
+from logging_utils import configure_json_logging
 from worker.fixworker import fix
 
 DB_PATH = os.getenv("DB_PATH", "jobs.db")
@@ -25,8 +26,8 @@ MAX_JOB_RETRIES = int(os.getenv("MAX_JOB_RETRIES", "2"))
 TRAIN_CODE_PATH = Path("worker") / "train_code.txt"
 LOG_DIR = Path("logs")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("controller")
+configure_json_logging(service="controller")
+log = logging.getLogger("trainctl.controller")
 
 
 def _init_core_client() -> client.CoreV1Api:
@@ -54,7 +55,10 @@ def read_training_code() -> str:
     try:
         return TRAIN_CODE_PATH.read_text(encoding="utf-8")
     except OSError as exc:
-        log.warning("Unable to read training code from %s: %s", TRAIN_CODE_PATH, exc)
+        log.warning(
+            "Unable to read training code",
+            extra={"event": "training_code_read_error"},
+        )
         return ""
 
 
@@ -159,14 +163,23 @@ def _requeue_or_fail(conn: sqlite3.Connection, job: sqlite3.Row, reason: str) ->
     retries = int(job["retries"] or 0) + 1
 
     if retries <= MAX_JOB_RETRIES:
-        log.warning("Re-queueing job %s after %s (retry %s/%s)", job_id, reason, retries, MAX_JOB_RETRIES)
+        log.warning(
+            "Re-queueing job",
+            extra={
+                "event": "job_requeued",
+                "job_id": job_id,
+            },
+        )
         conn.execute(
             "UPDATE jobs SET status='queued', retries=?, pod_name=NULL, updated_at=? WHERE id=?",
             (retries, utc_now_iso(), job_id),
         )
         return
 
-    log.error("Marking job %s as failed after %s (retry budget exhausted)", job_id, reason)
+    log.error(
+        "Marking job as failed after retry budget exhausted",
+        extra={"event": "job_failed", "job_id": job_id},
+    )
     _mark_failed(conn, job_id, retries)
 
 
@@ -178,7 +191,10 @@ def _attempt_fix(job_id: str) -> None:
     try:
         fix(job_id, training_code)
     except Exception as exc:
-        log.error("Auto-fix failed for job %s: %s", job_id, exc)
+        log.error(
+            "Auto-fix failed",
+            extra={"event": "autofix_failed", "job_id": job_id},
+        )
 
 
 def _handle_queued_job(conn: sqlite3.Connection, job: sqlite3.Row) -> None:
@@ -187,11 +203,15 @@ def _handle_queued_job(conn: sqlite3.Connection, job: sqlite3.Row) -> None:
         config = json.loads(job["config"] or "{}")
     except json.JSONDecodeError:
         _mark_failed(conn, job_id, int(job["retries"] or 0))
-        log.error("Job %s has invalid config JSON and was marked failed", job_id)
+        log.error(
+            "Job has invalid config JSON and was marked failed",
+            extra={"event": "job_invalid_config", "job_id": job_id},
+        )
         return
 
     launch_pod(job_id, WORKER_IMAGE, config)
     _mark_running(conn, job_id)
+    log.info("Pod launched", extra={"event": "pod_launched", "job_id": job_id})
 
 
 def _handle_running_job(conn: sqlite3.Connection, job: sqlite3.Row) -> None:
@@ -230,7 +250,10 @@ def run_once() -> None:
                 process_job(conn, job)
             except Exception as exc:
                 job_id = job["id"]
-                log.error("Error while processing job %s: %s", job_id, exc)
+                log.error(
+                    "Error while processing job",
+                    extra={"event": "job_process_error", "job_id": job_id},
+                )
                 _requeue_or_fail(conn, job, reason="controller_exception")
 
                 if job["status"] == "running":
@@ -238,12 +261,12 @@ def run_once() -> None:
 
 
 def run() -> None:
-    log.info("Controller started")
+    log.info("Controller started", extra={"event": "controller_started"})
     while True:
         try:
             run_once()
         except Exception as exc:
-            log.error("Controller loop error: %s", exc)
+            log.error("Controller loop error", extra={"event": "controller_loop_error"})
         time.sleep(POLL_INTERVAL_SECONDS)
 
 
