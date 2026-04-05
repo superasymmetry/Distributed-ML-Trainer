@@ -4,13 +4,26 @@ set -euo pipefail
 BASE_URL="${BASE_URL:-http://127.0.0.1:8000}"
 NAMESPACE="${NAMESPACE:-default}"
 WAIT_SECONDS="${WAIT_SECONDS:-180}"
+KUBECTL_TIMEOUT_SECONDS="${KUBECTL_TIMEOUT_SECONDS:-15}"
+
+ensure_kubernetes_access() {
+  local current_context
+  current_context="$(kubectl config current-context 2>/dev/null || echo "unknown")"
+  if ! kubectl cluster-info --request-timeout="${KUBECTL_TIMEOUT_SECONDS}s" >/dev/null 2>&1; then
+    echo "kubectl cannot reach a cluster (current context: '$current_context')."
+    echo "Enable Kubernetes in Docker Desktop and switch context before running this script."
+    exit 1
+  fi
+}
 
 if ! command -v kubectl >/dev/null 2>&1; then
   echo "kubectl not found. Install kubectl and configure cluster access first."
   exit 1
 fi
+ensure_kubernetes_access
 
 create_job_response="$(mktemp)"
+trap 'rm -f "$create_job_response"' EXIT
 create_code="$(
   curl -sS -o "$create_job_response" -w "%{http_code}" \
     -X POST "$BASE_URL/jobs" \

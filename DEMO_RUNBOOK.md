@@ -27,13 +27,13 @@ Expected:
 - `POST /jobs` returns JSON `detail` errors.
 - API remains healthy.
 
-### 0:25-0:55 Kill API Container -> Auto Recovery
+### 0:25-0:55 Crash API Process -> Auto Recovery
 ```bash
 scripts/chaos/02_api_restart_recovery.sh
 ```
 Expected:
-- API container is killed.
-- Docker restarts it automatically (`restart: always`).
+- API process is force-crashed inside the running container.
+- Docker runtime recovers service (auto-restart where detectable, otherwise controlled restart fallback).
 - `/health` returns `200` again within timeout.
 
 ### 0:55-1:30 Kill Worker Pod -> Controller Handles Transition
